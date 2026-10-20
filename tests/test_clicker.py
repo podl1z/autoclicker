@@ -10,11 +10,14 @@ from autoclicker.clicker import ClickSettings, Clicker
 class FakeMouse:
     def __init__(self):
         self.calls = []
+        self.positions = []
         self.lock = threading.Lock()
+        self.position = (0, 0)
 
     def click(self, button, count=1):
         with self.lock:
             self.calls.append((button, count))
+            self.positions.append(self.position)
 
 
 def run_for(clicker, settings, seconds):
@@ -88,3 +91,48 @@ def test_rejects_bad_interval(interval):
 def test_rejects_unknown_button():
     with pytest.raises(ValueError):
         ClickSettings(button="side")
+
+
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_rejects_bad_missing_timeout(timeout):
+    with pytest.raises(ValueError):
+        ClickSettings(missing_timeout_s=timeout)
+
+
+def test_clicks_at_located_target():
+    mouse = FakeMouse()
+    clicker = Clicker(mouse)
+    run_for(clicker, ClickSettings(interval_ms=10, locate=lambda: (120, 340)), 0.1)
+    assert mouse.positions and all(p == (120, 340) for p in mouse.positions)
+    assert clicker.stop_reason is None
+
+
+def test_stops_by_itself_when_target_missing():
+    mouse = FakeMouse()
+    clicker = Clicker(mouse)
+    started = time.monotonic()
+    clicker.start(
+        ClickSettings(interval_ms=10, locate=lambda: None, missing_timeout_s=0.2)
+    )
+    clicker._thread.join(timeout=2)
+    assert not clicker.running
+    assert 0.2 <= time.monotonic() - started < 1
+    assert mouse.calls == []
+    assert clicker.stop_reason == "missing"
+
+
+def test_short_disappearance_does_not_stop():
+    mouse = FakeMouse()
+    clicker = Clicker(mouse)
+    started = time.monotonic()
+
+    def locate():
+        # Кнопка пропадает на 0.1 с, будто страница перезагружается.
+        return None if 0.05 < time.monotonic() - started < 0.15 else (1, 2)
+
+    clicker.start(ClickSettings(interval_ms=10, locate=locate, missing_timeout_s=0.3))
+    time.sleep(0.3)
+    assert clicker.running
+    clicker.stop()
+    assert clicker.stop_reason is None
+    assert clicker.count >= 5

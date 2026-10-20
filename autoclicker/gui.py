@@ -6,10 +6,14 @@ from tkinter import messagebox, ttk
 
 from .clicker import ClickSettings, Clicker
 from .hotkeys import HotkeyListener
+from .picker import pick_region
+from .vision import load_template, locate_on_screen, save_template, to_photo
 
 BUTTON_LABELS = {"Левая": "left", "Правая": "right", "Средняя": "middle"}
 CLICK_TYPES = {"Одинарный": False, "Двойной": True}
 POLL_MS = 100
+# Превью уменьшаем, чтобы поиск не нашёл кнопку в нашем же окне.
+PREVIEW_SUBSAMPLE = 2
 
 
 class App(tk.Tk):
@@ -22,8 +26,10 @@ class App(tk.Tk):
         # Хоткей приходит из потока pynput, поэтому передаём его в GUI через очередь.
         self._events = queue.Queue()
         self.hotkeys = HotkeyListener(lambda: self._events.put("toggle"))
+        self.template = load_template()
 
         self._build()
+        self._show_template()
         self.hotkeys.start()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(POLL_MS, self._poll)
@@ -68,17 +74,54 @@ class App(tk.Tk):
         self.click_type.grid(row=1, column=1, padx=8, pady=2)
         self._inputs += [self.button, self.click_type]
 
+        target = ttk.LabelFrame(root, text="Куда кликать", padding=8)
+        target.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.by_image = tk.BooleanVar(value=False)
+        for row, (text, value) in enumerate([("По курсору", False), ("По картинке", True)]):
+            radio = ttk.Radiobutton(target, text=text, variable=self.by_image, value=value)
+            radio.grid(row=row, column=0, columnspan=2, sticky="w")
+            self._inputs.append(radio)
+        pick_btn = ttk.Button(
+            target, text="Выбрать кнопку на экране…", command=self.pick_template
+        )
+        pick_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 4))
+        self.preview = ttk.Label(target, text="Кнопка не выбрана", anchor="center")
+        self.preview.grid(row=3, column=0, columnspan=2, pady=(0, 6))
+        ttk.Label(target, text="Стоп, если не видно, сек:").grid(row=4, column=0, sticky="w")
+        self.missing_timeout = tk.StringVar(value="5")
+        timeout_spin = ttk.Spinbox(
+            target, from_=1, to=3600, textvariable=self.missing_timeout, width=5
+        )
+        timeout_spin.grid(row=4, column=1, sticky="e")
+        self._inputs += [pick_btn, timeout_spin]
+
         self.start_btn = ttk.Button(root, text="Старт (F6)", command=self.start)
-        self.start_btn.grid(row=2, column=0, sticky="ew", padx=(0, 4))
+        self.start_btn.grid(row=3, column=0, sticky="ew", padx=(0, 4))
         self.stop_btn = ttk.Button(
             root, text="Стоп (F6)", command=self.stop, state="disabled"
         )
-        self.stop_btn.grid(row=2, column=1, sticky="ew", padx=(4, 0))
+        self.stop_btn.grid(row=3, column=1, sticky="ew", padx=(4, 0))
 
         self.status = tk.StringVar(value="Остановлен")
         ttk.Label(root, textvariable=self.status).grid(
-            row=3, column=0, columnspan=2, pady=(8, 0)
+            row=4, column=0, columnspan=2, pady=(8, 0)
         )
+
+    def pick_template(self):
+        template = pick_region(self)
+        if template is None:
+            return
+        self.template = template
+        save_template(template)
+        self.by_image.set(True)
+        self._show_template()
+
+    def _show_template(self):
+        if self.template is None:
+            return
+        # Ссылку держим на виджете, иначе картинку соберёт сборщик мусора.
+        self.preview.photo = to_photo(self.template, PREVIEW_SUBSAMPLE)
+        self.preview.configure(image=self.preview.photo, text="")
 
     def _read_settings(self):
         try:
@@ -91,10 +134,22 @@ class App(tk.Tk):
         if min(h, m, s, ms) < 0:
             raise ValueError("Интервал не может быть отрицательным")
         total_ms = ((h * 60 + m) * 60 + s) * 1000 + ms
+        locate = None
+        if self.by_image.get():
+            if self.template is None:
+                raise ValueError("Сначала выберите кнопку на экране")
+            template = self.template
+            locate = lambda: locate_on_screen(template)
+        try:
+            missing_timeout = float(self.missing_timeout.get())
+        except ValueError:
+            raise ValueError("Время ожидания кнопки должно быть числом")
         return ClickSettings(
             interval_ms=total_ms,
             button=BUTTON_LABELS[self.button.get()],
             double=CLICK_TYPES[self.click_type.get()],
+            locate=locate,
+            missing_timeout_s=missing_timeout,
         )
 
     def start(self):
@@ -134,8 +189,13 @@ class App(tk.Tk):
             except queue.Empty:
                 break
             self.toggle()
+        # Кликер может остановиться сам (кнопка пропала) — вернуть окно в исходное состояние.
+        if not self.clicker.running and self.stop_btn.instate(["!disabled"]):
+            self.stop()
         if self.clicker.running:
             self.status.set(f"Кликает… кликов: {self.clicker.count}")
+        elif self.clicker.stop_reason == "missing":
+            self.status.set(f"Кнопка пропала — остановлено. Кликов: {self.clicker.count}")
         else:
             self.status.set(f"Остановлен. Кликов: {self.clicker.count}")
         self.after(POLL_MS, self._poll)
